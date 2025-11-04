@@ -622,7 +622,7 @@ async def _fire_relative(name: str, sid: Optional[int], start_time: dtime, fire_
         label = _get_label_cached(name, sid)
         start_label = start_time.strftime("%H:%M")
         if offset_min < 0:
-            msg_student = f"{mention} 수업 {abs(offset_min)}분 전입니다.\n⏰ 시작 시각 : {start_label}\n준비되면 `/출석` 해주세요!"
+            msg_student = f"{mention} 수업 {abs(offset_min)}분 전입니다.\n⏰ 시작 시각 : {start_label}\n📝 수업 전 구글 드라이브에서 오늘 학습 자료를 다운로드!\n✅ 수업 준비되면 `/출석` 하고 화면 공유 해주세요!"
             log = f"[상황실] {label} 수업 {abs(offset_min)}분 전 알림 전송"
         else:
             msg_student = f"{mention} 수업이 {offset_min}분 경과했습니다. (시작 {start_label})"
