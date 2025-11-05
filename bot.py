@@ -712,6 +712,35 @@ async def midnight_scheduler():
         except Exception as e:
             print(f"[자정 새로고침/예약 오류] {type(e).__name__}: {e}")
 
+async def homework_scheduler():
+    """
+    매일 18:00, 22:00 KST에 _send_homework_reminders() 실행
+    """
+    await bot.wait_until_ready()
+    targets = (dtime(18, 0), dtime(22, 0))
+
+    while not bot.is_closed():
+        now = datetime.now(KST)
+
+        # 오늘 남은 트리거 계산
+        today_triggers = []
+        for tt in targets:
+            cand = datetime.combine(now.date(), tt, KST)
+            if cand > now:
+                today_triggers.append(cand)
+        if not today_triggers:
+            # 오늘 다 지났으면 내일 18:00
+            nxt = datetime.combine(now.date() + timedelta(days=1), targets[0], KST)
+        else:
+            nxt = min(today_triggers)
+
+        await asyncio.sleep(max(0, (nxt - now).total_seconds()))
+        try:
+            await _send_homework_reminders(nxt.hour)  # 18 또는 22
+        except Exception as e:
+            print(f"[숙제 리마인더 오류] {type(e).__name__}: {e}")
+        # 다음 루프에서 다시 계산
+
 # ====== Slash: 출석/선생님/숙제 ======
 @bot.tree.command(name="출석", description="오늘자 출석을 기록합니다.")
 @app_commands.guild_only()
@@ -944,6 +973,42 @@ def _pick_homework_msg(hour: int) -> str:
     if hour == 18:
         return random.choice(REMINDER_18H)
     return random.choice(REMINDER_22H)
+
+async def _send_homework_reminders(trigger_hour: int):
+    """
+    18시/22시에 '내일 수업 있는 학생들'에게 숙제 리마인드 전송.
+    - 대상일: today+1
+    - 중복 세션 학생은 1회만 전송
+    - 상황실 로그 남김
+    - 이미 해당 날짜에 숙제 제출(homework[tomorrow])된 학생은 스킵 (원치 않으면 아래 필터 제거)
+    """
+    today = datetime.now(KST).date()
+    target_day = today + timedelta(days=1)
+    day_iso = target_day.isoformat()
+
+    sessions = await effective_sessions_for(target_day)
+    candidate_sids = {sid for _, _, sid in sessions if isinstance(sid, int)}
+
+    # 이미 제출한 학생 스킵 (원치 않으면 submitted 필터 제거)
+    submitted = set(homework.get(day_iso, []))
+    targets = sorted(sid for sid in candidate_sids if sid not in submitted)
+
+    msg_body = _pick_homework_msg(trigger_hour)
+
+    sent = 0
+    for sid in targets:
+        ch = _find_student_text_channel_by_id(sid, "학생")
+        if not ch:
+            continue
+        try:
+            await ch.send(f"<@{sid}>\n{msg_body}")
+            sent += 1
+        except Exception:
+            pass
+
+    room = await _get_text_channel_cached(SITUATION_ROOM_CHANNEL_ID)
+    if room:
+        await room.send(f"[숙제 리마인더] {trigger_hour}:00 전송 완료 — 대상 {len(targets)}명 / 실제 {sent}건 ({day_iso})")
 
 # ====== Slash: 변경/보강/휴강 — ID-only 저장 ======
 async def _after_override_commit(dt: date):
@@ -1223,25 +1288,32 @@ async def _background_after_ready():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (KST {datetime.now(KST)})")
-    await refresh_student_id_map()
-    # **이름키→ID-only 마이그레이션**
-    await migrate_overrides_to_id_only()
 
+    # 부팅시 맵/마이그레이션
+    await refresh_student_id_map()
+    await migrate_overrides_to_id_only()  # 이름키→ID-only
+
+    # 오늘 상대 알림(-10,75,85) 예약
     try:
         await schedule_all_offsets_for_today()
         print("[부팅] 오늘 알림 예약 완료", ALERT_OFFSETS)
     except Exception as e:
-        print(f"[부팅 예약 오류] {e}")
+        print(f"[부팅 예약 오류] {type(e).__name__}: {e}")
 
+    # 시트 캐시 워밍업(기존대로 유지)
+    try:
+        await SHEET_CACHE.get_parsed()
+        print("[워밍업] 시트 캐시 준비 완료")
+    except Exception as e:
+        print(f"[워밍업 실패] {type(e).__name__}: {e}")
+
+    # 스케줄러 일괄 기동 (중복 방지)
     if not getattr(bot, "_sched_start", False):
         bot._sched_start = True
-        asyncio.create_task(daily_scheduler())
-        asyncio.create_task(midnight_scheduler())
-        print("[스케줄러] daily + midnight 시작")
-
-    if not getattr(bot, "_bg_start", False):
-        bot._bg_start = True
-        asyncio.create_task(_background_after_ready())
+        asyncio.create_task(daily_scheduler())      # 13:00 집계
+        asyncio.create_task(midnight_scheduler())   # 자정 집계/예약
+        asyncio.create_task(homework_scheduler())   # 18:00 / 22:00 숙제 리마인더
+        print("[스케줄러] daily + midnight + homework(18/22시) 시작")
 
 # Health server (Render 등)
 async def _start_health_server():
