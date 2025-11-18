@@ -790,55 +790,182 @@ async def slash_hw_submit(inter: discord.Interaction, when: Optional[str] = None
     today = now.date()
     desired_day: Optional[date] = None
 
+    # 1) 날짜 결정 로직 (기존 그대로 사용)
     if not when:
         # 오늘 남은 수업 있으면 오늘, 아니면 이후 첫 수업
         for i in range(0, 31):
             d = today + timedelta(days=i)
             sessions = await effective_sessions_for(d)
-            times = [t for n,t,sid in sessions if isinstance(sid,int) and sid==uid]
-            if not times: continue
-            if i==0:
-                if any((t.hour,t.minute) > (now.hour,now.minute) for t in times):
-                    desired_day = d; break
+            times = [t for n, t, sid in sessions if isinstance(sid, int) and sid == uid]
+            if not times:
+                continue
+            if i == 0:
+                # 오늘: 아직 남은 수업이 있으면 오늘
+                if any((t.hour, t.minute) > (now.hour, now.minute) for t in times):
+                    desired_day = d
+                    break
             else:
-                desired_day = d; break
+                desired_day = d
+                break
     else:
         s = when.strip()
-        if s in ("오늘","today"): desired_day = today
-        elif s in ("내일","tomorrow"):
-            for i in range(1, 31+1):
+        if s in ("오늘", "today"):
+            desired_day = today
+        elif s in ("내일", "tomorrow"):
+            for i in range(1, 31 + 1):
                 d = today + timedelta(days=i)
-                if any(isinstance(sid,int) and sid==uid for _,_,sid in await effective_sessions_for(d)):
-                    desired_day = d; break
+                if any(isinstance(sid, int) and sid == uid for _, _, sid in await effective_sessions_for(d)):
+                    desired_day = d
+                    break
         else:
+            # YYYY-MM-DD / MM-DD 처리
             if re.fullmatch(r"\d{1,2}-\d{1,2}", s):
                 y = datetime.now(KST).year
-                mm, dd = s.split("-"); s = f"{y}-{mm.zfill(2)}-{dd.zfill(2)}"
+                mm, dd = s.split("-")
+                s = f"{y}-{mm.zfill(2)}-{dd.zfill(2)}"
             try:
                 cand = date.fromisoformat(s)
             except Exception:
-                await inter.followup.send("날짜 형식이 올바르지 않아요. YYYY-MM-DD / MM-DD / '내일'을 사용해 주세요.", ephemeral=False); return
-            if any(isinstance(sid,int) and sid==uid for _,_,sid in await effective_sessions_for(cand)):
+                await inter.followup.send(
+                    "날짜 형식이 올바르지 않아요. YYYY-MM-DD / MM-DD / '내일'을 사용해 주세요.",
+                    ephemeral=False,
+                )
+                return
+            if any(isinstance(sid, int) and sid == uid for _, _, sid in await effective_sessions_for(cand)):
                 desired_day = cand
             else:
-                await inter.followup.send(f"{cand.isoformat()}에는 수업이 없는 것 같아요 🧐", ephemeral=False); return
+                await inter.followup.send(
+                    f"{cand.isoformat()}에는 수업이 없는 것 같아요 🧐",
+                    ephemeral=False,
+                )
+                return
 
     if not desired_day:
-        await inter.followup.send("앞으로 예정된 수업 날짜를 찾지 못했어요. 🧐", ephemeral=False); return
+        await inter.followup.send(
+            "앞으로 예정된 수업 날짜를 찾지 못했어요. 🧐",
+            ephemeral=False,
+        )
+        return
 
     day_iso = desired_day.isoformat()
-    sessions = await effective_sessions_for(desired_day)
-    candidate_sids = {sid for _,_,sid in sessions if isinstance(sid,int)}
 
-    async with _homework_lock:
-        arr = set(homework.get(day_iso, []))
-        arr.add(uid); arr |= candidate_sids
-        homework[day_iso] = sorted(arr)
-        save_json_atomic(HOMEWORK_FILE, homework)
+    # 2) 숙제 제출 정보 저장 방식 변경
+    #    homework[day_iso] = {"submitted": [sid, ...]} 형식으로 관리
+    try:
+        async with _homework_lock:
+            raw = homework.get(day_iso)
+            submitted: Set[int]
+            if isinstance(raw, dict):
+                submitted = {int(s) for s in raw.get("submitted", []) if isinstance(s, int) or str(s).isdigit()}
+            else:
+                # 예전 형식(list 등)은 무시하고 새 형식으로 갈아탄다.
+                submitted = set()
+
+            submitted.add(uid)
+            homework[day_iso] = {
+                "submitted": sorted(submitted),
+            }
+            save_json_atomic(HOMEWORK_FILE, homework)
+    except Exception as e:
+        print(f"[/숙제 저장 오류] {type(e).__name__}: {e}")
+        await inter.followup.send("숙제 제출 기록 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=False)
+        return
 
     await inter.followup.send(
-        f"{inter.user.mention}\n**{day_iso}까지 제출할 숙제**가 제출되었습니다. 🎉", ephemeral=False
+        f"{inter.user.mention}\n**{day_iso}까지 제출할 숙제**가 제출되었습니다. 🎉",
+        ephemeral=False,
     )
+
+@bot.tree.command(name="숙제제출", description="특정 날짜의 숙제 제출 현황을 확인합니다.")
+@app_commands.describe(when="오늘/내일 또는 YYYY-MM-DD / MM-DD")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def slash_homework_status(inter: discord.Interaction, when: str = "오늘"):
+    await inter.response.defer(ephemeral=True, thinking=True)
+
+    # 1) 날짜 파싱
+    day = _parse_day_input(when or "오늘")
+    if not day:
+        await inter.followup.send("날짜 형식 오류입니다. 오늘/내일 또는 YYYY-MM-DD / MM-DD 를 사용해주세요.", ephemeral=True)
+        return
+
+    day_iso = day.isoformat()
+
+    # 2) 그 날짜에 수업 있는 학생들 계산
+    try:
+        sessions = await effective_sessions_for(day)
+    except Exception as e:
+        await inter.followup.send(f"❌ 시간표 계산 실패: {type(e).__name__}: {e}", ephemeral=True)
+        return
+
+    # sid 기준으로 한 번씩만 정리 (가장 이른 수업 시각 기준)
+    per_sid: Dict[int, Tuple[str, Optional[dtime]]] = {}
+    for name, t, sid in sessions:
+        if not isinstance(sid, int):
+            continue
+        label = _label_from_guild_or_default(name, sid)
+        if sid not in per_sid or (per_sid[sid][1] is not None and t < per_sid[sid][1]):
+            per_sid[sid] = (label, t)
+
+    if not per_sid:
+        await inter.followup.send(f"`{day_iso}`에는 수업이 없는 것 같아요.", ephemeral=True)
+        return
+
+    # 3) homework.json 에서 제출 정보 읽기
+    legacy_format = False
+    submitted_sids: Set[int] = set()
+    try:
+        async with _homework_lock:
+            raw = homework.get(day_iso)
+            if isinstance(raw, dict):
+                submitted_sids = {
+                    int(s) for s in raw.get("submitted", [])
+                    if isinstance(s, int) or str(s).isdigit()
+                }
+            elif isinstance(raw, list):
+                # ⚠️ 예전 형식: 이 경우에는 정확한 제출자 정보를 알 수 없음
+                legacy_format = True
+            else:
+                submitted_sids = set()
+    except Exception as e:
+        await inter.followup.send(f"❌ 숙제 데이터 읽기 실패: {type(e).__name__}: {e}", ephemeral=True)
+        return
+
+    lines: List[str] = []
+    lines.append(f"**[숙제 제출 현황] {day_iso}**")
+
+    if legacy_format:
+        # 4-A) 예전 형식 → 제출 여부를 신뢰할 수 없음
+        lines.append("")
+        lines.append("⚠️ 이 날짜의 숙제 데이터는 **구버전 형식**이라,")
+        lines.append("   누가 실제로 `/숙제`를 눌렀는지 **구분할 수 없습니다.**")
+        lines.append("")
+        lines.append("🗓️ 수업 대상자 목록 (제출 여부: 알 수 없음)")
+        for sid, (label, t) in sorted(per_sid.items(), key=lambda x: (x[1][1] or dtime(0, 0))):
+            time_str = (x[1][1].strftime("%H:%M") if (x:= (sid, (label, t)))[1][1] else "--:--")
+            lines.append(f"- {label}: {time_str} (제출 여부 알 수 없음)")
+        await inter.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    # 4-B) 새 형식 → 명확하게 제출/미제출 표시
+    total = len(per_sid)
+    submitted_cnt = sum(1 for sid in per_sid.keys() if sid in submitted_sids)
+    rate = int(round(submitted_cnt * 100 / total)) if total > 0 else 0
+
+    lines.append("")
+    lines.append(f"요약: 총 {total}명 중 {submitted_cnt}명 제출 ({rate}%)")
+    lines.append("")
+    lines.append("📋 학생별 현황")
+
+    for sid, (label, t) in sorted(per_sid.items(), key=lambda x: (x[1][1] or dtime(0, 0), x[1][0])):
+        time_str = t.strftime("%H:%M") if t else "--:--"
+        if sid in submitted_sids:
+            mark = "✅ 제출"
+        else:
+            mark = "❌ 미제출"
+        lines.append(f"- {label}: {time_str} [{mark}]")
+
+    await inter.followup.send("\n".join(lines), ephemeral=True)
 
 # ====== Slash: 신규 (/신규 — 시트 검증만, 쓰기 없음) ======
 def _name_id_maps_from_cache(parsed: Dict[str, Any]):
