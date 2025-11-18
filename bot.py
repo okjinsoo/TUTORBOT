@@ -498,7 +498,10 @@ async def build_timetable_message(day: date) -> str:
         if not (sd <= day <= ed2):
             continue
         pairs = info.get("pairs", [])
-        times = sorted([t for (d_lbl,t) in pairs if WEEKDAY_MAP.get(d_lbl)==wd], key=lambda x:(x.hour,x.minute))
+        times = sorted(
+            [t for (d_lbl, t) in pairs if WEEKDAY_MAP.get(d_lbl) == wd],
+            key=lambda x: (x.hour, x.minute),
+        )
         if times:
             base_on_day[sid] = (name, times)
 
@@ -507,12 +510,15 @@ async def build_timetable_message(day: date) -> str:
     sid_keys = [int(k) for k in ovs_day.keys() if isinstance(k, str) and k.isdigit()]
     display_sids = set(base_on_day.keys()) | set(sid_keys)
 
-    def _tl(t: dtime): return t.strftime("%H:%M")
+    def _tl(t: dtime) -> str:
+        return t.strftime("%H:%M")
+
     changed_lines, makeup_lines, canceled_lines = [], [], []
 
     for sid in sorted(display_sids):
         e = _ov_get_id(ovs_day, sid)
-        if not e: continue
+        if not e:
+            continue
         # 라벨
         base_name = (base_on_day.get(sid, ("학생", []))[0])
         label = _label_from_guild_or_default(base_name, sid)
@@ -533,9 +539,9 @@ async def build_timetable_message(day: date) -> str:
                 tt = parse_time_str(str(it.get("to")))
                 if tf and tt:
                     pairs_fmt.append((tf, f"{_tl(tf)}→{_tl(tt)}"))
-            pairs_fmt.sort(key=lambda p:(p[0].hour,p[0].minute))
+            pairs_fmt.sort(key=lambda p: (p[0].hour, p[0].minute))
             if pairs_fmt:
-                changed_lines.append(f"- {label}: " + ", ".join(p for _,p in pairs_fmt))
+                changed_lines.append(f"- {label}: " + ", ".join(p for _, p in pairs_fmt))
         else:
             # 단일(레거시)
             ch = e.get("change")
@@ -551,31 +557,81 @@ async def build_timetable_message(day: date) -> str:
         add_times = []
         for a in adds:
             ta = parse_time_str(str(a))
-            if ta: add_times.append(ta)
-        add_times = sorted(set(add_times), key=lambda t:(t.hour,t.minute))
+            if ta:
+                add_times.append(ta)
+        add_times = sorted(set(add_times), key=lambda t: (t.hour, t.minute))
         if add_times:
             makeup_lines.append(f"- {label}: " + ", ".join(_tl(t) for t in add_times))
 
-    # 최종 세션 + 출석
+    # ===== 여기서부터 출석 + 숙제 제출 정보 합치기 =====
+
+    # 최종 세션
     effective = await effective_sessions_for(day, parsed)
     attended_ids = set(attendance.get(day_iso, []))
-    eff_lines = []
-    for n,t,sid in sorted(((n,t,sid) for (n,t,sid) in effective if isinstance(sid,int)),
-                          key=lambda x:(_label_from_guild_or_default(x[0],x[2]), x[1])):
-        label = _label_from_guild_or_default(n, sid)
-        mark = "✅ 출석" if sid in attended_ids else "❌ 미출석"
-        eff_lines.append(f"- {label}: {t.strftime('%H:%M')} [{mark}]")
 
-    lines = [f"**[수업 집계] ({day_iso})**",""]
+    # 숙제 제출 정보 (새 형식: {"submitted":[sid,...]} 기준)
+    submitted_ids: Set[int] = set()
+    raw_hw = homework.get(day_iso)
+
+    if isinstance(raw_hw, dict):
+        arr = raw_hw.get("submitted", [])
+        for x in arr:
+            if isinstance(x, int):
+                submitted_ids.add(x)
+            elif isinstance(x, str) and x.isdigit():
+                submitted_ids.add(int(x))
+    elif isinstance(raw_hw, list):
+        # (구 형식: [sid,...] 이었던 경우, 일단 '제출로 간주'만 해줌)
+        for x in raw_hw:
+            if isinstance(x, int):
+                submitted_ids.add(x)
+            elif isinstance(x, str) and x.isdigit():
+                submitted_ids.add(int(x))
+
+    eff_lines = []
+    for n, t, sid in sorted(
+        ((n, t, sid) for (n, t, sid) in effective if isinstance(sid, int)),
+        key=lambda x: (_label_from_guild_or_default(x[0], x[2]), x[1]),
+    ):
+        label = _label_from_guild_or_default(n, sid)
+        # 출석 여부
+        att_mark = "✅ 출석" if sid in attended_ids else "❌ 미출석"
+        # 숙제 여부
+        hw_mark = "📘 숙제제출" if sid in submitted_ids else "🕒 미제출"
+        eff_lines.append(f"- {label}: {t.strftime('%H:%M')} [{att_mark} / {hw_mark}]")
+
+    # (요약용 통계 — 필요없으면 이 블록 통째로 지워도 됨)
+    uniq_sids = {sid for (_, _, sid) in effective if isinstance(sid, int)}
+    total = len(uniq_sids)
+    att_cnt = sum(1 for sid in uniq_sids if sid in attended_ids)
+    hw_cnt = sum(1 for sid in uniq_sids if sid in submitted_ids)
+    att_rate = int(round(att_cnt * 100 / total)) if total > 0 else 0
+    hw_rate = int(round(hw_cnt * 100 / total)) if total > 0 else 0
+
+    lines = [f"**[수업 집계] ({day_iso})**", ""]
+
+    # 보강
     lines.append("**📌 보강**" if makeup_lines else "**📌 보강**: 없음")
     lines += (sorted(makeup_lines) if makeup_lines else [])
     lines.append("")
+
+    # 변경
     lines.append("**🔄 변경**" if changed_lines else "**🔄 변경**: 없음")
     lines += (sorted(changed_lines) if changed_lines else [])
     lines.append("")
+
+    # 휴강
     lines.append("**⛔ 휴강**" if canceled_lines else "**⛔ 휴강**: 없음")
     lines += (sorted(canceled_lines) if canceled_lines else [])
     lines.append("")
+
+    # 출석/숙제 요약
+    lines.append("**📊 출석·숙제 요약**")
+    lines.append(f"- 출석: {att_cnt}/{total}명 ({att_rate}%)")
+    lines.append(f"- 숙제: {hw_cnt}/{total}명 ({hw_rate}%)")
+    lines.append("")
+
+    # 최종 수업
     lines.append("**🗓️ 수업 (최종)**" if eff_lines else "**🗓️ 수업 (최종)**: 없음")
     lines += eff_lines
 
