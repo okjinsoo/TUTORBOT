@@ -3,3 +3,4 @@ python-dotenv
 gspread
 google-auth
 aiohttp          # 헬스체크용 초간단 웹서버
+google-cloud-firestore
