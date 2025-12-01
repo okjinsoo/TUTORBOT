@@ -52,9 +52,26 @@ def init_firestore_client(service_account_json_path: str):
         print("[Firestore] SERVICE_ACCOUNT_JSON 경로 미설정")
         return None
     try:
-        creds = service_account.Credentials.from_service_account_file(service_account_json_path)
-        _firestore_client = firestore.Client(credentials=creds, project=creds.project_id)
-        print(f"[Firestore] 연결 성공: project={creds.project_id}")
+        # 서비스 계정 JSON 불러오기
+        with open(service_account_json_path, "r", encoding="utf-8") as f:
+            service_account_info = json.load(f)
+
+        # Credentials 생성
+        creds = service_account.Credentials.from_service_account_info(service_account_info)
+
+        # Firestore 클라이언트 생성
+        _firestore_client = firestore.Client(
+            credentials=creds,
+            project=creds.project_id
+        )
+
+        # 🔥 여기 “정확한 디버그 정보” 추가
+        print(
+            f"[Firestore] 연결 성공: "
+            f"project={creds.project_id}, "
+            f"sa_email={service_account_info.get('client_email')}"
+        )
+
         return _firestore_client
     except Exception as e:
         print(f"[Firestore 연결 실패] {type(e).__name__}: {e}")
