@@ -37,6 +37,51 @@ SHEET_ID = (ENV("SHEET_ID") or "").strip()
 SHEET_NAME = (ENV("SHEET_NAME") or "시간표").strip()
 SERVICE_ACCOUNT_JSON = (ENV("SERVICE_ACCOUNT_JSON") or "service_account.json").strip()
 
+# ===== Firestore integration =====
+# 필요 패키지: pip install google-cloud-firestore google-auth
+from google.oauth2 import service_account
+from google.cloud import firestore
+
+_firestore_client = None
+
+def init_firestore_client(service_account_json_path: str):
+    """서비스 계정 JSON 파일 경로로 Firestore 클라이언트를 초기화합니다.
+       실패하면 _firestore_client는 None으로 남고 로그를 출력합니다."""
+    global _firestore_client
+    if not service_account_json_path:
+        print("[Firestore] SERVICE_ACCOUNT_JSON 경로 미설정")
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(service_account_json_path)
+        _firestore_client = firestore.Client(credentials=creds, project=creds.project_id)
+        print(f"[Firestore] 연결 성공: project={creds.project_id}")
+        return _firestore_client
+    except Exception as e:
+        print(f"[Firestore 연결 실패] {type(e).__name__}: {e}")
+        _firestore_client = None
+        return None
+
+def firestore_set_doc(collection: str, doc_id: str, data: dict):
+    """문서 전체를 덮어쓰기(set). _firestore_client 미설정 시 RuntimeError 발생."""
+    if not _firestore_client:
+        raise RuntimeError("Firestore client not initialized")
+    ref = _firestore_client.collection(collection).document(doc_id)
+    ref.set(data)
+
+def firestore_get_doc(collection: str, doc_id: str, default=None):
+    """문서 읽기(없으면 default). 오류 발생 시 default 반환."""
+    if not _firestore_client:
+        return default
+    ref = _firestore_client.collection(collection).document(doc_id)
+    try:
+        doc = ref.get()
+        if doc.exists:
+            return doc.to_dict()
+    except Exception as e:
+        print(f"[Firestore 읽기 오류] {collection}/{doc_id}: {e}")
+    return default
+
+
 CATEGORY_SUFFIX = " 채널"
 TEXT_NAME = "채팅채널"
 VOICE_NAME = "음성채널"
@@ -83,17 +128,93 @@ overrides: Dict[str, dict] = load_json_with_recovery(OVERRIDE_FILE, {})
 attendance: Dict[str, List[int]] = load_json_with_recovery(ATTENDANCE_FILE, {})
 homework: Dict[str, List[int]] = load_json_with_recovery(HOMEWORK_FILE, {})
 
+def load_local_json(path: str, default):
+    """로컬 JSON 파일을 안전하게 읽습니다. 실패하면 default를 돌려줍니다."""
+    try:
+        return load_json_with_recovery(path, default)
+    except Exception as e:
+        print(f"[로컬 로드 실패] {path}: {e}")
+        return default
+
+def load_from_firestore_or_local():
+    """
+    앱 시작할 때 Firestore에서 먼저 데이터를 읽어오고,
+    실패하면 로컬 파일(overrides.json 등)에서 읽어옵니다.
+    """
+    global overrides, attendance, homework
+
+    # 1) Firestore가 준비돼 있으면 Firestore에서 먼저 시도
+    if _firestore_client:
+        try:
+            o = firestore_get_doc("persist", "overrides", None)
+            a = firestore_get_doc("persist", "attendance", None)
+            h = firestore_get_doc("persist", "homework", None)
+
+            if isinstance(o, dict):
+                overrides = o
+            else:
+                overrides = load_local_json(OVERRIDE_FILE, {})
+
+            if isinstance(a, dict):
+                attendance = a
+            else:
+                attendance = load_local_json(ATTENDANCE_FILE, {})
+
+            if isinstance(h, dict):
+                homework = h
+            else:
+                homework = load_local_json(HOMEWORK_FILE, {})
+
+            print("[Load] Firestore 우선 로드 완료 (없으면 로컬 사용)")
+            return
+        except Exception as e:
+            print(f"[Load 실패] Firestore 로드 오류: {e}")
+
+    # 2) Firestore를 못 쓰는 경우 → 로컬 파일에서 읽기
+    overrides = load_local_json(OVERRIDE_FILE, {})
+    attendance = load_local_json(ATTENDANCE_FILE, {})
+    homework = load_local_json(HOMEWORK_FILE, {})
+    print("[Load] 로컬 파일 로드 완료")
+
+
 async def save_overrides():
     async with _overrides_lock:
-        save_json_atomic(OVERRIDE_FILE, overrides)
+        try:
+            if _firestore_client:
+                firestore_set_doc("persist", "overrides", overrides)
+            save_json_atomic(OVERRIDE_FILE, overrides)
+        except Exception as e:
+            print(f"[save_overrides 오류] {type(e).__name__}: {e}")
+            try:
+                save_json_atomic(OVERRIDE_FILE, overrides)
+            except Exception as e2:
+                print(f"[save_overrides 로컬백업 실패] {type(e2).__name__}: {e2}")
 
 async def save_attendance():
-    async with _attendance_lock:
+    try:
+        if _firestore_client:
+            firestore_set_doc("persist", "attendance", attendance)
         save_json_atomic(ATTENDANCE_FILE, attendance)
+    except Exception as e:
+        print(f"[save_attendance 오류] {type(e).__name__}: {e}")
+        try:
+            save_json_atomic(ATTENDANCE_FILE, attendance)
+        except Exception as e2:
+            print(f"[save_attendance 로컬백업 실패] {type(e2).__name__}: {e2}")
+
 
 async def save_homework():
-    async with _homework_lock:
+    try:
+        if _firestore_client:
+            firestore_set_doc("persist", "homework", homework)
         save_json_atomic(HOMEWORK_FILE, homework)
+    except Exception as e:
+        print(f"[save_homework 오류] {type(e).__name__}: {e}")
+        try:
+            save_json_atomic(HOMEWORK_FILE, homework)
+        except Exception as e2:
+            print(f"[save_homework 로컬백업 실패] {type(e2).__name__}: {e2}")
+
 
 # ====== Time / Parse ======
 WEEKDAY_MAP = {"월":0,"화":1,"수":2,"목":3,"금":4,"토":5,"일":6}
@@ -245,7 +366,8 @@ async def refresh_student_id_map():
         STUDENT_ID_MAP, _ = _rebuild_name_id_maps(parsed)
         print(f"[학생ID맵] 로드 OK: {len(STUDENT_ID_MAP)}명")
     except Exception as e:
-        print(f"[학생ID맵 로드 오류] {e}")
+        print("[학생ID맵 로드 오류]", repr(e))
+
 
 # ====== Label / Guild utils ======
 def _label_from_guild_or_default(name: str, sid: Optional[int]) -> str:
@@ -652,7 +774,7 @@ async def post_day_summary_to_teacher(day: date):
     await send_long(u, out)
 
 # ====== Alerts / Homework (원형 유지, 핵심 로직은 ID 기반) ======
-ALERT_OFFSETS = (-10, 75, 85)
+ALERT_OFFSETS = (-10, 75)
 rel_tasks: Dict[Tuple[Optional[int], int, str, int], asyncio.Task] = {}
 oneoff_homework_tasks: Dict[Tuple[int, str], asyncio.Task] = {}
 last_question_at: Dict[int, float] = {}
@@ -808,10 +930,23 @@ async def slash_attend(inter: discord.Interaction):
         async with _attendance_lock:
             arr = attendance.get(today_iso, [])
             if uid in arr:
-                await inter.followup.send(f"{inter.user.mention} 이미 출석으로 기록되어 있습니다. ✅", ephemeral=False); return
-            arr.append(uid); attendance[today_iso] = arr
-            save_json_atomic(ATTENDANCE_FILE, attendance)
-        await inter.followup.send(f"{inter.user.mention} ✅ 출석 완료! (기록됨)", ephemeral=False)
+                await inter.followup.send(
+                    f"{inter.user.mention} 이미 출석으로 기록되어 있습니다. ✅",
+                    ephemeral=False
+                )
+                return
+
+            arr.append(uid)
+            attendance[today_iso] = arr
+
+            # 🔹 출석 저장 전담 함수 사용
+            await save_attendance()
+
+        await inter.followup.send(
+            f"{inter.user.mention} ✅ 출석 완료! (기록됨)",
+            ephemeral=False
+        )
+
     except Exception as e:
         print(f"[/출석 오류] {type(e).__name__}: {e}")
         await inter.followup.send("출석 기록 중 문제가 발생했어요.", ephemeral=False)
@@ -912,7 +1047,10 @@ async def slash_hw_submit(inter: discord.Interaction, when: Optional[str] = None
             raw = homework.get(day_iso)
             submitted: Set[int]
             if isinstance(raw, dict):
-                submitted = {int(s) for s in raw.get("submitted", []) if isinstance(s, int) or str(s).isdigit()}
+                submitted = {
+                    int(s) for s in raw.get("submitted", [])
+                    if isinstance(s, int) or str(s).isdigit()
+                }
             else:
                 # 예전 형식(list 등)은 무시하고 새 형식으로 갈아탄다.
                 submitted = set()
@@ -921,7 +1059,15 @@ async def slash_hw_submit(inter: discord.Interaction, when: Optional[str] = None
             homework[day_iso] = {
                 "submitted": sorted(submitted),
             }
-            save_json_atomic(HOMEWORK_FILE, homework)
+
+            # 🔹 숙제 저장 전담 함수 사용
+            await save_homework()
+
+    except Exception as e:
+        print(f"[/숙제 저장 오류] {type(e).__name__}: {e}")
+        await inter.followup.send("숙제 제출 기록 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=False)
+        return
+
     except Exception as e:
         print(f"[/숙제 저장 오류] {type(e).__name__}: {e}")
         await inter.followup.send("숙제 제출 기록 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=False)
@@ -997,9 +1143,10 @@ async def slash_homework_status(inter: discord.Interaction, when: str = "오늘"
         lines.append("   누가 실제로 `/숙제`를 눌렀는지 **구분할 수 없습니다.**")
         lines.append("")
         lines.append("🗓️ 수업 대상자 목록 (제출 여부: 알 수 없음)")
-        for sid, (label, t) in sorted(per_sid.items(), key=lambda x: (x[1][1] or dtime(0, 0))):
-            time_str = (x[1][1].strftime("%H:%M") if (x:= (sid, (label, t)))[1][1] else "--:--")
-            lines.append(f"- {label}: {time_str} (제출 여부 알 수 없음)")
+        for sid, (label, t) in sorted(per_sid.items(), key=lambda x: (x[1][1] or dtime(0, 0), x[1][0])):
+            time_str = t.strftime("%H:%M") if t else "--:--"
+            mark = "✅ 제출" if sid in submitted_sids else "❌ 미제출"
+            lines.append(f"- {label}: {time_str} [{mark}]")
         await inter.followup.send("\n".join(lines), ephemeral=True)
         return
 
@@ -1158,13 +1305,6 @@ def _pick_homework_msg(hour: int) -> str:
     return random.choice(REMINDER_22H)
 
 async def _send_homework_reminders(trigger_hour: int):
-    """
-    18시/22시에 '내일 수업 있는 학생들'에게 숙제 리마인드 전송.
-    - 대상일: today+1
-    - 중복 세션 학생은 1회만 전송
-    - 상황실 로그 남김
-    - 이미 해당 날짜에 숙제 제출(homework[tomorrow])된 학생은 스킵 (원치 않으면 아래 필터 제거)
-    """
     today = datetime.now(KST).date()
     target_day = today + timedelta(days=1)
     day_iso = target_day.isoformat()
@@ -1172,8 +1312,30 @@ async def _send_homework_reminders(trigger_hour: int):
     sessions = await effective_sessions_for(target_day)
     candidate_sids = {sid for _, _, sid in sessions if isinstance(sid, int)}
 
-    # 이미 제출한 학생 스킵 (원치 않으면 submitted 필터 제거)
-    submitted = set(homework.get(day_iso, []))
+
+    # 🔹 새 형식: {"submitted": [sid,...]} 기준으로 읽기
+    submitted: Set[int] = set()
+    try:
+        async with _homework_lock:
+            raw = homework.get(day_iso)
+            if isinstance(raw, dict):
+                submitted = {
+                    int(s) for s in raw.get("submitted", [])
+                    if isinstance(s, int) or str(s).isdigit()
+                }
+            elif isinstance(raw, list):
+                # 구버전 형식([sid,...]) 남아있을 수도 있으니 최소한 호환
+                submitted = {
+                    int(s) for s in raw
+                    if isinstance(s, int) or str(s).isdigit()
+                }
+            else:
+                submitted = set()
+    except Exception as e:
+        print(f"[숙제 리마인더] homework 읽기 오류: {type(e).__name__}: {e}")
+        submitted = set()
+
+    # 이미 제출한 학생은 리마인드 대상에서 제외
     targets = sorted(sid for sid in candidate_sids if sid not in submitted)
 
     msg_body = _pick_homework_msg(trigger_hour)
@@ -1390,7 +1552,7 @@ async def slash_timetable(inter: discord.Interaction, when: str = "오늘"):
         pass
     await inter.followup.send(f"✅ {day.isoformat()} 집계를 상황실에 게시했습니다.", ephemeral=True)
 
-@bot.tree.command(name="새로고침", description="시트 새로고침 + 오늘 집계 재게시 + 알림(-10,75,85) 재설정")
+@bot.tree.command(name="새로고침", description="시트 새로고침 + 오늘 집계 재게시 + 알림(-10,75) 재설정")
 @app_commands.default_permissions(manage_channels=True)
 async def slash_reload(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
@@ -1466,7 +1628,8 @@ async def _background_after_ready():
         await SHEET_CACHE.get_parsed()
         print("[워밍업] 시트 캐시 준비 완료")
     except Exception as e:
-        print(f"[워밍업 실패] {type(e).__name__}: {e}")
+        print("[워밍업 실패] PermissionError repr:", repr(e))
+
 
 @bot.event
 async def on_ready():
@@ -1476,19 +1639,22 @@ async def on_ready():
     await refresh_student_id_map()
     await migrate_overrides_to_id_only()  # 이름키→ID-only
 
-    # 오늘 상대 알림(-10,75,85) 예약
+    # 오늘 상대 알림(-10,75) 예약
+
     try:
         await schedule_all_offsets_for_today()
         print("[부팅] 오늘 알림 예약 완료", ALERT_OFFSETS)
     except Exception as e:
-        print(f"[부팅 예약 오류] {type(e).__name__}: {e}")
+
+        print("[부팅 예약 오류] PermissionError repr:", repr(e))
 
     # 시트 캐시 워밍업(기존대로 유지)
     try:
         await SHEET_CACHE.get_parsed()
         print("[워밍업] 시트 캐시 준비 완료")
     except Exception as e:
-        print(f"[워밍업 실패] {type(e).__name__}: {e}")
+        print("[워밍업 실패] PermissionError repr:", repr(e))
+
 
     # 스케줄러 일괄 기동 (중복 방지)
     if not getattr(bot, "_sched_start", False):
@@ -1497,6 +1663,9 @@ async def on_ready():
         asyncio.create_task(midnight_scheduler())   # 자정 집계/예약
         asyncio.create_task(homework_scheduler())   # 18:00 / 22:00 숙제 리마인더
         print("[스케줄러] daily + midnight + homework(18/22시) 시작")
+
+    # 🔹 슬래시 sync + 시트 워밍업 (기존 함수를 재사용)
+    asyncio.create_task(_background_after_ready())
 
 # Health server (Render 등)
 async def _start_health_server():
@@ -1510,6 +1679,11 @@ async def _start_health_server():
 
 async def _main():
     asyncio.create_task(_start_health_server())
+
+    # Firestore 초기화 + 데이터 로드
+    init_firestore_client(SERVICE_ACCOUNT_JSON)
+    load_from_firestore_or_local()
+
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN이 비어있습니다.")
     await bot.start(BOT_TOKEN)
