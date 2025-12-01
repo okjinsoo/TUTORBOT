@@ -600,6 +600,33 @@ async def send_long(dest, text: str, max_len: int = 1990):
     if buf.strip():
         await dest.send(buf)
 
+async def send_long_message(inter: discord.Interaction, text: str, *, ephemeral: bool = False):
+    """디스코드 2000자 제한을 피하기 위해 메시지를 여러 개로 나눠 보내는 헬퍼 함수."""
+    limit = 2000
+
+    # 1) 전체 길이가 2000자 이하면 한 번에 전송
+    if len(text) <= limit:
+        if inter.response.is_done():
+            await inter.followup.send(text, ephemeral=ephemeral)
+        else:
+            await inter.response.send_message(text, ephemeral=ephemeral)
+        return
+
+    # 2) 첫 번째 조각
+    first_chunk = text[:limit]
+    rest = text[limit:]
+
+    if inter.response.is_done():
+        await inter.followup.send(first_chunk, ephemeral=ephemeral)
+    else:
+        await inter.response.send_message(first_chunk, ephemeral=ephemeral)
+
+    # 3) 나머지 조각들
+    while rest:
+        chunk = rest[:limit]
+        rest = rest[limit:]
+        await inter.followup.send(chunk, ephemeral=ephemeral)
+
 async def build_timetable_message(day: date) -> str:
     day_iso = day.isoformat()
     parsed = await SHEET_CACHE.get_parsed()
@@ -1533,24 +1560,43 @@ async def slash_cancel_remove(inter: discord.Interaction, student: discord.Membe
     await inter.followup.send("✅ 휴강 해제 완료.", ephemeral=True)
 
 # ====== 관리: 시간표/새로고침/로그 ======
-@bot.tree.command(name="시간표", description="[수업 집계] 출력 및 상황실 게시")
+@bot.tree.command(name="시간표", description="특정 날짜의 수업 시간표를 보여줍니다.")
 @app_commands.describe(when="오늘/내일 또는 YYYY-MM-DD / MM-DD")
+@app_commands.guild_only()
 async def slash_timetable(inter: discord.Interaction, when: str = "오늘"):
+    # 답변 지연(로딩 표시)
     await inter.response.defer(ephemeral=True, thinking=True)
+
+    # 1) 날짜 파싱
     day = _parse_day_input(when or "오늘")
     if not day:
-        await inter.followup.send("날짜 형식 오류", ephemeral=True); return
+        # 날짜 형식이 잘못된 경우
+        if inter.response.is_done():
+            await inter.followup.send(
+                "날짜 형식 오류입니다. 오늘/내일 또는 YYYY-MM-DD / MM-DD 를 사용해주세요.",
+                ephemeral=True,
+            )
+        else:
+            await inter.response.send_message(
+                "날짜 형식 오류입니다. 오늘/내일 또는 YYYY-MM-DD / MM-DD 를 사용해주세요.",
+                ephemeral=True,
+            )
+        return
+
+    # 2) 시간표 메시지 생성
     try:
-        out = await build_timetable_message(day)
+        msg = await build_timetable_message(day)
     except Exception as e:
-        await inter.followup.send(f"❌ 시간표 로드 실패: {type(e).__name__}: {e}", ephemeral=True); return
-    try:
-        room = await _get_text_channel_cached(SITUATION_ROOM_CHANNEL_ID)
-        if isinstance(room, discord.TextChannel):
-            await room.send(out)
-    except Exception:
-        pass
-    await inter.followup.send(f"✅ {day.isoformat()} 집계를 상황실에 게시했습니다.", ephemeral=True)
+        print(f"[/시간표 오류] {type(e).__name__}: {e}")
+        if inter.response.is_done():
+            await inter.followup.send("시간표를 불러오는 중 문제가 발생했습니다.", ephemeral=True)
+        else:
+            await inter.response.send_message("시간표를 불러오는 중 문제가 발생했습니다.", ephemeral=True)
+        return
+
+    # 3) 2000자 제한을 고려해 나눠 보내기
+    #    (현재는 개인에게만 보이도록 ephemeral=True 로 설정)
+    await send_long_message(inter, msg, ephemeral=True)
 
 @bot.tree.command(name="새로고침", description="시트 새로고침 + 오늘 집계 재게시 + 알림(-10,75) 재설정")
 @app_commands.default_permissions(manage_channels=True)
