@@ -648,6 +648,10 @@ async def build_timetable_message(day: date) -> str:
     day_iso = day.isoformat()
     parsed = await SHEET_CACHE.get_parsed()
 
+    # ✅ D-day용 맵: 서비스 종료일이 있는 모든 학생
+    dday_map: Dict[int, int] = {}      # sid -> 남은 일수 (0이면 D-DAY)
+    enddate_map: Dict[int, date] = {}  # sid -> 실제 서비스 종료일
+
     # 기본 수업(서비스기간 반영)
     wd = day.weekday()
     base_on_day: Dict[int, Tuple[str, List[dtime]]] = {}  # sid -> (name, times)
@@ -663,6 +667,14 @@ async def build_timetable_message(day: date) -> str:
         ed2 = ed or (sd + timedelta(days=28))
         if not (sd <= day <= ed2):
             continue
+
+        # ⏰ D-day 계산 (서비스 종료일이 있는 학생 전체)
+        if ed is not None:
+            remain = (ed - day).days
+            if remain >= 0:  # 종료일 이후면 D-day 표기 안 함 (설계 선택, 추측입니다)
+                dday_map[sid] = remain
+                enddate_map[sid] = ed
+
         pairs = info.get("pairs", [])
         times = sorted(
             [t for (d_lbl, t) in pairs if WEEKDAY_MAP.get(d_lbl) == wd],
@@ -760,12 +772,24 @@ async def build_timetable_message(day: date) -> str:
         key=lambda x: (_label_from_guild_or_default(x[0], x[2]), x[1]),
     ):
         label = _label_from_guild_or_default(n, sid)
+
+        # ⏰ D-day 태그 (모든 학생 대상)
+        dday_tag = ""
+        if isinstance(sid, int) and sid in dday_map:
+            remain = dday_map[sid]
+            if remain == 0:
+                dday_tag = " (D-DAY)"
+            else:
+                dday_tag = f" (D-{remain})"
+
         # 출석 여부
         att_mark = "✅ 출석" if sid in attended_ids else "❌ 미출석"
         # 숙제 여부
         hw_mark = "📘 숙제제출" if sid in submitted_ids else "🕒 미제출"
-        eff_lines.append(f"- {label}: {t.strftime('%H:%M')} [{att_mark} / {hw_mark}]")
-
+        eff_lines.append(
+            f"- {label}{dday_tag}: {t.strftime('%H:%M')} [{att_mark} / {hw_mark}]"
+        )
+        
     # (요약용 통계 — 필요없으면 이 블록 통째로 지워도 됨)
     uniq_sids = {sid for (_, _, sid) in effective if isinstance(sid, int)}
     total = len(uniq_sids)
