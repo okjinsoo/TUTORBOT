@@ -1773,8 +1773,24 @@ async def _main():
 
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN이 비어있습니다.")
-    await bot.start(BOT_TOKEN)
+
+    try:
+        # 여기서 Discord 로그인 시도
+        await bot.start(BOT_TOKEN)
+    except discord.HTTPException as e:
+        # 429 글로벌 레이트 리밋인 경우: 프로세스를 죽이지 말고 '대기 모드'로 전환
+        if getattr(e, "status", None) == 429:
+            print("[치명] Discord 글로벌 레이트 리밋(429)로 로그인 차단 상태입니다.")
+            print("       일정 시간 후 수동 재시작/재배포가 필요합니다. (봇은 지금 대기 상태)")
+            # Render가 재시작 루프에 빠지지 않도록, 여기서 그냥 무한 대기
+            while True:
+                await asyncio.sleep(600)
+        else:
+            # 다른 HTTPException 은 기존처럼 터뜨려서 디버깅
+            raise
 
 if __name__ == "__main__":
-    try: asyncio.run(_main())
-    except KeyboardInterrupt: pass
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
