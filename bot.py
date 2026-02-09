@@ -4,6 +4,30 @@
 import os, json, re, asyncio, random, traceback
 from typing import Dict, List, Tuple, Optional, Any, Set
 from datetime import datetime, date, timedelta, time as dtime, timezone
+def _retry_after_seconds(e) -> float | None:
+    # discord.py 버전에 따라 구조가 다를 수 있어 최대한 안전하게 시도
+    try:
+        resp = getattr(e, "response", None)
+        hdrs = getattr(resp, "headers", None) or {}
+        ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+        if ra:
+            return float(ra)
+        ra2 = hdrs.get("X-RateLimit-Reset-After") or hdrs.get("x-ratelimit-reset-after")
+        if ra2:
+            return float(ra2)
+    except Exception:
+        pass
+
+    # 일부는 e.text에 dict 형태로 들어올 수 있음
+    try:
+        txt = getattr(e, "text", None)
+        if isinstance(txt, dict) and "retry_after" in txt:
+            return float(txt["retry_after"])
+    except Exception:
+        pass
+
+    return None
+
 
 # ====== KST ======
 try:
@@ -1774,20 +1798,41 @@ async def _main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN이 비어있습니다.")
 
-    try:
-        # 여기서 Discord 로그인 시도
-        await bot.start(BOT_TOKEN)
-    except discord.HTTPException as e:
-        # 429 글로벌 레이트 리밋인 경우: 프로세스를 죽이지 말고 '대기 모드'로 전환
-        if getattr(e, "status", None) == 429:
-            print("[치명] Discord 글로벌 레이트 리밋(429)로 로그인 차단 상태입니다.")
-            print("       일정 시간 후 수동 재시작/재배포가 필요합니다. (봇은 지금 대기 상태)")
-            # Render가 재시작 루프에 빠지지 않도록, 여기서 그냥 무한 대기
-            while True:
-                await asyncio.sleep(600)
-        else:
-            # 다른 HTTPException 은 기존처럼 터뜨려서 디버깅
-            raise
+    attempt = 0
+
+    # ✅ 429 자동복구: 매우 느린 재시도(백오프)
+    while True:
+        try:
+            print("[Discord] 로그인 시도 시작")
+            await bot.start(BOT_TOKEN)
+            return  # bot이 종료되면 여기로 돌아올 수 있음
+        except discord.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                attempt += 1
+                ra = _retry_after_seconds(e)
+
+                # Retry-After가 있으면 그걸 따르고,
+                # 없으면 30~60분 사이 랜덤 대기(재차단 방지용 '느린' 전략)
+                if isinstance(ra, (int, float)) and ra > 0:
+                    wait = ra
+                else:
+                    wait = random.randint(30 * 60, 60 * 60)
+
+                print("[치명] Discord 글로벌 레이트 리밋(429) — 자동 복구 모드")
+                print(f"       {wait:.0f}초 대기 후 재시도 (시도 #{attempt})")
+
+                # 혹시 세션이 남아있으면 닫기 시도
+                try:
+                    if not bot.is_closed():
+                        await bot.close()
+                except Exception:
+                    pass
+
+                # 지터 약간
+                await asyncio.sleep(wait + random.uniform(0, 3))
+                continue
+
+            raise  # 429가 아니면 그대로 터뜨려서 원인 확인
 
 if __name__ == "__main__":
     try:
