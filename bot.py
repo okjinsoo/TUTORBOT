@@ -41,6 +41,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+discord.utils.setup_logging()
+
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
