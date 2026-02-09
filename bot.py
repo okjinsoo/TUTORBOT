@@ -61,6 +61,29 @@ SHEET_ID = (ENV("SHEET_ID") or "").strip()
 SHEET_NAME = (ENV("SHEET_NAME") or "시간표").strip()
 SERVICE_ACCOUNT_JSON = (ENV("SERVICE_ACCOUNT_JSON") or "service_account.json").strip()
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (ENV(name) or "").strip().lower()
+    if raw == "":
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    raw = (ENV(name) or "").strip()
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+# 429 안전모드:
+# - SAFE_MODE_429=1(기본)에서는 슬래시 sync를 자동으로 하지 않아 과호출 위험을 줄입니다.
+# - 정말 필요할 때만 ENABLE_SLASH_SYNC=1로 켜서 1회 sync 하세요.
+SAFE_MODE_429 = _env_flag("SAFE_MODE_429", True)
+ENABLE_SLASH_SYNC = _env_flag("ENABLE_SLASH_SYNC", not SAFE_MODE_429)
+RATE_LIMIT_WAIT_MIN = _env_int("RATE_LIMIT_WAIT_MIN", 20 if SAFE_MODE_429 else 30)
+RATE_LIMIT_WAIT_MAX = _env_int("RATE_LIMIT_WAIT_MAX", 45 if SAFE_MODE_429 else 60)
+
 # ===== Firestore integration =====
 # 필요 패키지: pip install google-cloud-firestore google-auth
 from google.oauth2 import service_account
@@ -126,6 +149,7 @@ def firestore_get_doc(collection: str, doc_id: str, default=None):
 CATEGORY_SUFFIX = " 채널"
 TEXT_NAME = "채팅채널"
 VOICE_NAME = "음성채널"
+_student_text_channel_cache: Dict[int, int] = {}
 
 # ====== Files ======
 OVERRIDE_FILE   = "overrides.json"   # { "YYYY-MM-DD": { "<sid str>": {cancel,change,changes,makeup}, ... } }
@@ -135,6 +159,8 @@ HOMEWORK_FILE   = "homework.json"    # { "YYYY-MM-DD": [sid,...] }
 _overrides_lock = asyncio.Lock()
 _attendance_lock = asyncio.Lock()
 _homework_lock = asyncio.Lock()
+_ready_boot_lock = asyncio.Lock()
+_post_ready_lock = asyncio.Lock()
 
 def _safe_json_dumps(x): return json.dumps(x, ensure_ascii=False, indent=2)
 
@@ -220,41 +246,26 @@ def load_from_firestore_or_local():
 
 async def save_overrides():
     async with _overrides_lock:
-        try:
-            if _firestore_client:
-                firestore_set_doc("persist", "overrides", overrides)
-            save_json_atomic(OVERRIDE_FILE, overrides)
-        except Exception as e:
-            print(f"[save_overrides 오류] {type(e).__name__}: {e}")
-            try:
-                save_json_atomic(OVERRIDE_FILE, overrides)
-            except Exception as e2:
-                print(f"[save_overrides 로컬백업 실패] {type(e2).__name__}: {e2}")
+        _persist_json_snapshot("overrides", OVERRIDE_FILE, overrides, "save_overrides")
 
 async def save_attendance():
-    try:
-        if _firestore_client:
-            firestore_set_doc("persist", "attendance", attendance)
-        save_json_atomic(ATTENDANCE_FILE, attendance)
-    except Exception as e:
-        print(f"[save_attendance 오류] {type(e).__name__}: {e}")
-        try:
-            save_json_atomic(ATTENDANCE_FILE, attendance)
-        except Exception as e2:
-            print(f"[save_attendance 로컬백업 실패] {type(e2).__name__}: {e2}")
+    _persist_json_snapshot("attendance", ATTENDANCE_FILE, attendance, "save_attendance")
 
 
 async def save_homework():
+    _persist_json_snapshot("homework", HOMEWORK_FILE, homework, "save_homework")
+
+def _persist_json_snapshot(doc_id: str, path: str, data: Any, tag: str):
     try:
         if _firestore_client:
-            firestore_set_doc("persist", "homework", homework)
-        save_json_atomic(HOMEWORK_FILE, homework)
+            firestore_set_doc("persist", doc_id, data)
+        save_json_atomic(path, data)
     except Exception as e:
-        print(f"[save_homework 오류] {type(e).__name__}: {e}")
+        print(f"[{tag} 오류] {type(e).__name__}: {e}")
         try:
-            save_json_atomic(HOMEWORK_FILE, homework)
+            save_json_atomic(path, data)
         except Exception as e2:
-            print(f"[save_homework 로컬백업 실패] {type(e2).__name__}: {e2}")
+            print(f"[{tag} 로컬백업 실패] {type(e2).__name__}: {e2}")
 
 
 # ====== Time / Parse ======
@@ -295,6 +306,24 @@ def _parse_day_input(when: str) -> Optional[date]:
         except: return None
     return None
 
+def _to_int_set(items: Any) -> Set[int]:
+    out: Set[int] = set()
+    if not isinstance(items, (list, tuple, set)):
+        return out
+    for x in items:
+        if isinstance(x, int):
+            out.add(x)
+        elif isinstance(x, str) and x.isdigit():
+            out.add(int(x))
+    return out
+
+def _extract_submitted_sids(raw: Any, *, allow_legacy_list: bool) -> Set[int]:
+    if isinstance(raw, dict):
+        return _to_int_set(raw.get("submitted", []))
+    if allow_legacy_list and isinstance(raw, list):
+        return _to_int_set(raw)
+    return set()
+
 # ====== Google Sheets ======
 import gspread
 from google.oauth2.service_account import Credentials
@@ -313,13 +342,13 @@ class SheetCache:
         self._lock = asyncio.Lock()
 
     async def get_rows(self):
-        now = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        now = loop.time()
         if self._rows is not None and (now - self._ts) <= self.ttl:
             return self._rows
         async with self._lock:
-            if self._rows is not None and (asyncio.get_event_loop().time() - self._ts) <= self.ttl:
+            if self._rows is not None and (loop.time() - self._ts) <= self.ttl:
                 return self._rows
-            loop = asyncio.get_running_loop()
             def _fetch():
                 gc = gs_client()
                 ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
@@ -327,11 +356,11 @@ class SheetCache:
             rows = await loop.run_in_executor(None, _fetch)
             self._rows = rows
             self._parsed = None
-            self._ts = asyncio.get_event_loop().time()
+            self._ts = loop.time()
             return rows
 
     async def get_parsed(self):
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         if self._parsed is not None and (now - self._ts) <= self.ttl:
             return self._parsed
         rows = await self.get_rows()
@@ -439,6 +468,14 @@ async def _get_user_cached(uid: Optional[int]) -> Optional[discord.User]:
 
 def _find_student_text_channel_by_id(student_id: Optional[int], fallback_name: str) -> Optional[discord.TextChannel]:
     if not isinstance(student_id, int): return None
+
+    cached_cid = _student_text_channel_cache.get(student_id)
+    if cached_cid:
+        cached = bot.get_channel(cached_cid)
+        if isinstance(cached, discord.TextChannel):
+            return cached
+        _student_text_channel_cache.pop(student_id, None)
+
     for g in bot.guilds:
         m = g.get_member(student_id)
         if not m: continue
@@ -448,13 +485,16 @@ def _find_student_text_channel_by_id(student_id: Optional[int], fallback_name: s
         cat = discord.utils.get(g.categories, name=cat_name)
         if cat:
             text = discord.utils.get(cat.text_channels, name=TEXT_NAME) or (cat.text_channels[0] if cat.text_channels else None)
-            if text: return text
+            if text:
+                _student_text_channel_cache[student_id] = text.id
+                return text
         # 2) 토픽에 SID:<id> 표시된 텍스트 채널
         sid_tag = f"SID:{student_id}"
         for cat in g.categories:
             for tx in cat.text_channels:
                 try:
                     if (tx.topic or "").find(sid_tag) != -1:
+                        _student_text_channel_cache[student_id] = tx.id
                         return tx
                 except Exception:
                     continue
@@ -512,14 +552,6 @@ def ov_add_makeup_id(ovs_day: dict, sid: int, t: Any) -> dict:
     e["makeup"] = mm
     return e
 
-def ov_remove_makeup_id(ovs_day: dict, sid: int, t: Any) -> dict:
-    tt = parse_time_str(str(t))
-    if not tt: raise ValueError("보강 시간 형식 오류")
-    e = _ov_get_or_create_id(ovs_day, sid)
-    hhmm = tt.strftime("%H:%M")
-    e["makeup"] = [x for x in (e.get("makeup") or []) if x != hhmm]
-    return e
-
 def _cleanup_entry_if_empty_id(ovs_day: dict, sid: int):
     e = ovs_day.get(str(sid))
     if not isinstance(e, dict): return
@@ -528,7 +560,7 @@ def _cleanup_entry_if_empty_id(ovs_day: dict, sid: int):
         except Exception: pass
 
 # ---- Migration: 이름키 제거/이관 ----
-async def migrate_overrides_to_id_only():
+async def migrate_overrides_to_id_only(*, refresh_map: bool = True):
     """
     이전 파일에 '이름키'가 남아있는 경우:
       1) 같은 내용의 ID키가 이미 있으면 이름키 삭제
@@ -536,7 +568,8 @@ async def migrate_overrides_to_id_only():
       3) 둘 다 안되면 '표시에만 쓰이던 이름키'로 간주하고 **삭제** (ID-only 정책상 무시)
     """
     try:
-        await refresh_student_id_map()
+        if refresh_map:
+            await refresh_student_id_map()
         changed = False
         for day_iso, bucket in list(overrides.items()):
             if not isinstance(bucket, dict): continue
@@ -674,7 +707,6 @@ async def build_timetable_message(day: date) -> str:
 
     # ✅ D-day용 맵: 서비스 종료일이 있는 모든 학생
     dday_map: Dict[int, int] = {}      # sid -> 남은 일수 (0이면 D-DAY)
-    enddate_map: Dict[int, date] = {}  # sid -> 실제 서비스 종료일
 
     # 기본 수업(서비스기간 반영)
     wd = day.weekday()
@@ -697,7 +729,6 @@ async def build_timetable_message(day: date) -> str:
             remain = (ed - day).days
             if remain >= 0:  # 종료일 이후면 D-day 표기 안 함 (설계 선택, 추측입니다)
                 dday_map[sid] = remain
-                enddate_map[sid] = ed
 
         pairs = info.get("pairs", [])
         times = sorted(
@@ -772,23 +803,8 @@ async def build_timetable_message(day: date) -> str:
     attended_ids = set(attendance.get(day_iso, []))
 
     # 숙제 제출 정보 (새 형식: {"submitted":[sid,...]} 기준)
-    submitted_ids: Set[int] = set()
     raw_hw = homework.get(day_iso)
-
-    if isinstance(raw_hw, dict):
-        arr = raw_hw.get("submitted", [])
-        for x in arr:
-            if isinstance(x, int):
-                submitted_ids.add(x)
-            elif isinstance(x, str) and x.isdigit():
-                submitted_ids.add(int(x))
-    elif isinstance(raw_hw, list):
-        # (구 형식: [sid,...] 이었던 경우, 일단 '제출로 간주'만 해줌)
-        for x in raw_hw:
-            if isinstance(x, int):
-                submitted_ids.add(x)
-            elif isinstance(x, str) and x.isdigit():
-                submitted_ids.add(int(x))
+    submitted_ids = _extract_submitted_sids(raw_hw, allow_legacy_list=True)
 
     eff_lines = []
     for n, t, sid in sorted(
@@ -868,7 +884,6 @@ async def post_day_summary_to_teacher(day: date):
 # ====== Alerts / Homework (원형 유지, 핵심 로직은 ID 기반) ======
 ALERT_OFFSETS = (-10, 75)
 rel_tasks: Dict[Tuple[Optional[int], int, str, int], asyncio.Task] = {}
-oneoff_homework_tasks: Dict[Tuple[int, str], asyncio.Task] = {}
 last_question_at: Dict[int, float] = {}
 
 def _cancel_rel_tasks_for(day_iso: str, offset_min: Optional[int] = None):
@@ -881,15 +896,12 @@ def _cancel_rel_tasks_for(day_iso: str, offset_min: Optional[int] = None):
         if task and not task.done(): task.cancel()
     for k in to_cancel: rel_tasks.pop(k, None)
 
-def _get_label_cached(name: str, sid: Optional[int]) -> str:
-    return _label_from_guild_or_default(name, sid)
-
 async def _fire_relative(name: str, sid: Optional[int], start_time: dtime, fire_at: datetime, offset_min: int):
     try:
         await asyncio.sleep(max(0,(fire_at - datetime.now(KST)).total_seconds()))
         if datetime.now(KST) - fire_at > timedelta(minutes=2): return
         mention = f"<@{sid}>" if isinstance(sid,int) else name
-        label = _get_label_cached(name, sid)
+        label = _label_from_guild_or_default(name, sid)
         start_label = start_time.strftime("%H:%M")
         if offset_min < 0:
             msg_student = f"{mention} 수업 {abs(offset_min)}분 전입니다.\n⏰ 시작 시각 : {start_label}\n📝 수업 전 구글 드라이브에서 오늘 학습 자료를 다운로드!\n✅ 수업 준비되면 `/출석` 하고 화면 공유 해주세요!"
@@ -930,19 +942,6 @@ async def schedule_relative_alerts_for_today(offset_min: int):
 async def schedule_all_offsets_for_today():
     for off in ALERT_OFFSETS:
         await schedule_relative_alerts_for_today(off)
-
-def prune_old_homework(days: int = 60):
-    try:
-        cutoff = datetime.now(KST).date() - timedelta(days=days)
-        for k in list(homework.keys()):
-            try:
-                d = date.fromisoformat(k)
-            except Exception:
-                continue
-            if d < cutoff:
-                homework.pop(k, None)
-    except Exception as e:
-        print(f"[숙제 보관 정리 오류] {type(e).__name__}: {e}")
 
 # ====== Schedulers ======
 async def daily_scheduler():
@@ -1049,7 +1048,7 @@ async def slash_attend(inter: discord.Interaction):
 async def slash_call_teacher(inter: discord.Interaction, message: Optional[str] = None):
     await inter.response.defer(ephemeral=False, thinking=True)
     uid = inter.user.id
-    now_m = asyncio.get_event_loop().time()
+    now_m = asyncio.get_running_loop().time()
     last = last_question_at.get(uid, 0.0)
     if now_m - last < 60:
         await inter.followup.send("조금 전에도 호출이 있었어요. 1분 후에 다시 시도해주세요 🙏", ephemeral=False); return
@@ -1137,15 +1136,8 @@ async def slash_hw_submit(inter: discord.Interaction, when: Optional[str] = None
     try:
         async with _homework_lock:
             raw = homework.get(day_iso)
-            submitted: Set[int]
-            if isinstance(raw, dict):
-                submitted = {
-                    int(s) for s in raw.get("submitted", [])
-                    if isinstance(s, int) or str(s).isdigit()
-                }
-            else:
-                # 예전 형식(list 등)은 무시하고 새 형식으로 갈아탄다.
-                submitted = set()
+            # 예전 형식(list 등)은 무시하고 새 형식으로 갈아탑니다.
+            submitted = _extract_submitted_sids(raw, allow_legacy_list=False)
 
             submitted.add(uid)
             homework[day_iso] = {
@@ -1154,11 +1146,6 @@ async def slash_hw_submit(inter: discord.Interaction, when: Optional[str] = None
 
             # 🔹 숙제 저장 전담 함수 사용
             await save_homework()
-
-    except Exception as e:
-        print(f"[/숙제 저장 오류] {type(e).__name__}: {e}")
-        await inter.followup.send("숙제 제출 기록 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=False)
-        return
 
     except Exception as e:
         print(f"[/숙제 저장 오류] {type(e).__name__}: {e}")
@@ -1211,16 +1198,12 @@ async def slash_homework_status(inter: discord.Interaction, when: str = "오늘"
     try:
         async with _homework_lock:
             raw = homework.get(day_iso)
-            if isinstance(raw, dict):
-                submitted_sids = {
-                    int(s) for s in raw.get("submitted", [])
-                    if isinstance(s, int) or str(s).isdigit()
-                }
-            elif isinstance(raw, list):
+            if isinstance(raw, list):
                 # ⚠️ 예전 형식: 이 경우에는 정확한 제출자 정보를 알 수 없음
                 legacy_format = True
-            else:
                 submitted_sids = set()
+            else:
+                submitted_sids = _extract_submitted_sids(raw, allow_legacy_list=False)
     except Exception as e:
         await inter.followup.send(f"❌ 숙제 데이터 읽기 실패: {type(e).__name__}: {e}", ephemeral=True)
         return
@@ -1263,9 +1246,6 @@ async def slash_homework_status(inter: discord.Interaction, when: str = "오늘"
     await inter.followup.send("\n".join(lines), ephemeral=True)
 
 # ====== Slash: 신규 (/신규 — 시트 검증만, 쓰기 없음) ======
-def _name_id_maps_from_cache(parsed: Dict[str, Any]):
-    return _rebuild_name_id_maps(parsed)
-
 @bot.tree.command(name="신규", description="학생 닉네임/개인 카테고리 생성 (시트 검증만, 쓰기 없음)")
 @app_commands.describe(student="학생 유저(멘션)", realname="시트의 학생 이름과 동일하게(필수)")
 @app_commands.default_permissions(manage_channels=True)
@@ -1293,7 +1273,7 @@ async def slash_new(inter: discord.Interaction, student: discord.Member, realnam
         parsed = await SHEET_CACHE.get_parsed()
     except Exception as e:
         await inter.followup.send(f"❌ 시트 조회 실패: {type(e).__name__}: {e}", ephemeral=True); return
-    name_to_id, id_to_name = _name_id_maps_from_cache(parsed)
+    name_to_id, id_to_name = _rebuild_name_id_maps(parsed)
     mapped_sid  = name_to_id.get(base)        # 이름→ID
     mapped_name = id_to_name.get(sid)         # ID→이름
 
@@ -1360,7 +1340,7 @@ async def slash_new(inter: discord.Interaction, student: discord.Member, realnam
                 if t: overwrites[t] = discord.PermissionOverwrite(view_channel=True, send_messages=True, connect=True, speak=True)
             category = await guild.create_category(category_name, overwrites=overwrites, reason="/신규: 학생 전용 카테고리")
         text = discord.utils.get(category.text_channels, name=TEXT_NAME) or await guild.create_text_channel(TEXT_NAME, category=category, reason="/신규: 채팅채널")
-        voice = discord.utils.get(category.voice_channels, name=VOICE_NAME) or await guild.create_voice_channel(VOICE_NAME, category=category, reason="/신규: 음성채널")
+        discord.utils.get(category.voice_channels, name=VOICE_NAME) or await guild.create_voice_channel(VOICE_NAME, category=category, reason="/신규: 음성채널")
         # 텍스트 topic에 SID 태깅
         try:
             topic = text.topic or ""
@@ -1410,19 +1390,7 @@ async def _send_homework_reminders(trigger_hour: int):
     try:
         async with _homework_lock:
             raw = homework.get(day_iso)
-            if isinstance(raw, dict):
-                submitted = {
-                    int(s) for s in raw.get("submitted", [])
-                    if isinstance(s, int) or str(s).isdigit()
-                }
-            elif isinstance(raw, list):
-                # 구버전 형식([sid,...]) 남아있을 수도 있으니 최소한 호환
-                submitted = {
-                    int(s) for s in raw
-                    if isinstance(s, int) or str(s).isdigit()
-                }
-            else:
-                submitted = set()
+            submitted = _extract_submitted_sids(raw, allow_legacy_list=True)
     except Exception as e:
         print(f"[숙제 리마인더] homework 읽기 오류: {type(e).__name__}: {e}")
         submitted = set()
@@ -1496,7 +1464,7 @@ async def slash_change_clear(inter: discord.Interaction, student: discord.Member
     try:
         async with _overrides_lock:
             ovs_day = _ensure_day_bucket(day_iso)
-            e = ov_clear_changes_id(ovs_day, student.id)
+            ov_clear_changes_id(ovs_day, student.id)
             _cleanup_entry_if_empty_id(ovs_day, student.id)
             overrides[day_iso] = ovs_day
         await save_overrides()
@@ -1523,7 +1491,6 @@ async def slash_makeup(inter: discord.Interaction, student: discord.Member, when
         await inter.followup.send("❌ 시각은 HH:MM 형식이어야 합니다.", ephemeral=True); return
 
     day_iso = dt.isoformat()
-    sid_str = str(student.id)
 
     # (2) 현재 휴강 상태 여부 확인 (헬퍼 없이 직접 조회)
     ovs_day = overrides.get(day_iso) or {}
@@ -1615,7 +1582,7 @@ async def slash_cancel_remove(inter: discord.Interaction, student: discord.Membe
     try:
         async with _overrides_lock:
             ovs_day = _ensure_day_bucket(day_iso)
-            e = ov_set_cancel_id(ovs_day, student.id, False)
+            ov_set_cancel_id(ovs_day, student.id, False)
             _cleanup_entry_if_empty_id(ovs_day, student.id)
             overrides[day_iso] = ovs_day
         await save_overrides()
@@ -1722,61 +1689,91 @@ async def on_app_command_error(inter: discord.Interaction, error: app_commands.A
 
 # ====== Ready & Main ======
 async def _background_after_ready():
-    # 슬래시 동기화
-    try:
-        if GUILD_ID:
-            gobj = discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=gobj)
-            synced = await bot.tree.sync(guild=gobj)
-            print(f"✅ 길드({GUILD_ID}) 슬래시 등록: {len(synced)}개")
+    if getattr(bot, "_post_ready_once_done", False):
+        return
+
+    async with _post_ready_lock:
+        if getattr(bot, "_post_ready_once_done", False):
+            return
+
+        # 슬래시 동기화 (429 안전모드에서는 기본 비활성)
+        if ENABLE_SLASH_SYNC:
+            try:
+                if GUILD_ID:
+                    gobj = discord.Object(id=GUILD_ID)
+                    bot.tree.copy_global_to(guild=gobj)
+                    synced = await bot.tree.sync(guild=gobj)
+                    print(f"✅ 길드({GUILD_ID}) 슬래시 등록: {len(synced)}개")
+                else:
+                    synced = await bot.tree.sync()
+                    print(f"⚠️ GUILD_ID 미설정 → 글로벌 sync: {len(synced)}개")
+            except discord.HTTPException as e:
+                if getattr(e, "status", None) == 429:
+                    print("[429-safe] 슬래시 sync에서 429 감지: 자동 재시도하지 않고 건너뜁니다.")
+                else:
+                    print(f"[슬래시 등록 오류] {type(e).__name__}: {e}")
+            except Exception as e:
+                print(f"[슬래시 등록 오류] {type(e).__name__}: {e}")
         else:
-            synced = await bot.tree.sync()
-            print(f"⚠️ GUILD_ID 미설정 → 글로벌 sync: {len(synced)}개")
-    except Exception as e:
-        print(f"[슬래시 등록 오류] {e}")
-    # 시트 워밍업
-    try:
-        await SHEET_CACHE.get_parsed()
-        print("[워밍업] 시트 캐시 준비 완료")
-    except Exception as e:
-        print("[워밍업 실패] PermissionError repr:", repr(e))
+            print("[429-safe] ENABLE_SLASH_SYNC=0 → 슬래시 sync를 건너뜁니다.")
+
+        # 시트 워밍업
+        try:
+            await SHEET_CACHE.get_parsed()
+            print("[워밍업] 시트 캐시 준비 완료")
+        except Exception as e:
+            print("[워밍업 실패] PermissionError repr:", repr(e))
+
+        bot._post_ready_once_done = True
 
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (KST {datetime.now(KST)})")
 
-    # 부팅시 맵/마이그레이션
-    await refresh_student_id_map()
-    await migrate_overrides_to_id_only()  # 이름키→ID-only
+    # Discord 재연결 시 on_ready가 여러 번 호출될 수 있으므로
+    # 무거운 초기화는 1회만 수행합니다.
+    if getattr(bot, "_boot_once_done", False):
+        print("[429-safe] 재연결 감지: 부팅 초기화는 건너뜁니다.")
+        return
 
-    # 오늘 상대 알림(-10,75) 예약
+    async with _ready_boot_lock:
+        if getattr(bot, "_boot_once_done", False):
+            return
 
-    try:
-        await schedule_all_offsets_for_today()
-        print("[부팅] 오늘 알림 예약 완료", ALERT_OFFSETS)
-    except Exception as e:
+        # 부팅시 맵/마이그레이션
+        try:
+            await refresh_student_id_map()
+        except Exception as e:
+            print(f"[부팅 학생맵 오류] {type(e).__name__}: {e}")
 
-        print("[부팅 예약 오류] PermissionError repr:", repr(e))
+        try:
+            await migrate_overrides_to_id_only(refresh_map=False)  # 이름키→ID-only
+        except Exception as e:
+            print(f"[부팅 마이그레이션 오류] {type(e).__name__}: {e}")
 
-    # 시트 캐시 워밍업(기존대로 유지)
-    try:
-        await SHEET_CACHE.get_parsed()
-        print("[워밍업] 시트 캐시 준비 완료")
-    except Exception as e:
-        print("[워밍업 실패] PermissionError repr:", repr(e))
+        # 오늘 상대 알림(-10,75) 예약
 
+        try:
+            await schedule_all_offsets_for_today()
+            print("[부팅] 오늘 알림 예약 완료", ALERT_OFFSETS)
+        except Exception as e:
+            print("[부팅 예약 오류] PermissionError repr:", repr(e))
 
-    # 스케줄러 일괄 기동 (중복 방지)
-    if not getattr(bot, "_sched_start", False):
-        bot._sched_start = True
-        asyncio.create_task(daily_scheduler())      # 13:00 집계
-        asyncio.create_task(midnight_scheduler())   # 자정 집계/예약
-        asyncio.create_task(homework_scheduler())   # 18:00 / 22:00 숙제 리마인더
-        print("[스케줄러] daily + midnight + homework(18/22시) 시작")
+        # 스케줄러 일괄 기동 (중복 방지)
+        if not getattr(bot, "_sched_start", False):
+            bot._sched_start = True
+            asyncio.create_task(daily_scheduler())      # 13:00 집계
+            asyncio.create_task(midnight_scheduler())   # 자정 집계/예약
+            asyncio.create_task(homework_scheduler())   # 18:00 / 22:00 숙제 리마인더
+            print("[스케줄러] daily + midnight + homework(18/22시) 시작")
 
-    # 🔹 슬래시 sync + 시트 워밍업 (기존 함수를 재사용)
-    asyncio.create_task(_background_after_ready())
+        # 슬래시 sync + 시트 워밍업은 1회 비동기 실행
+        if not getattr(bot, "_post_ready_task_started", False):
+            bot._post_ready_task_started = True
+            asyncio.create_task(_background_after_ready())
+
+        bot._boot_once_done = True
 
 # Health server (Render 등)
 async def _start_health_server():
@@ -1794,6 +1791,12 @@ async def _main():
     # Firestore 초기화 + 데이터 로드
     init_firestore_client(SERVICE_ACCOUNT_JSON)
     load_from_firestore_or_local()
+
+    print(
+        f"[429-safe] SAFE_MODE_429={int(SAFE_MODE_429)} "
+        f"ENABLE_SLASH_SYNC={int(ENABLE_SLASH_SYNC)} "
+        f"BACKOFF={RATE_LIMIT_WAIT_MIN}-{RATE_LIMIT_WAIT_MAX}min"
+    )
 
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN이 비어있습니다.")
@@ -1816,7 +1819,9 @@ async def _main():
                 if isinstance(ra, (int, float)) and ra > 0:
                     wait = ra
                 else:
-                    wait = random.randint(30 * 60, 60 * 60)
+                    lo = max(1, min(RATE_LIMIT_WAIT_MIN, RATE_LIMIT_WAIT_MAX))
+                    hi = max(lo, max(RATE_LIMIT_WAIT_MIN, RATE_LIMIT_WAIT_MAX))
+                    wait = random.randint(lo * 60, hi * 60)
 
                 print("[치명] Discord 글로벌 레이트 리밋(429) — 자동 복구 모드")
                 print(f"       {wait:.0f}초 대기 후 재시도 (시도 #{attempt})")
