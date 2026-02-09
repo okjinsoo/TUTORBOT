@@ -85,6 +85,7 @@ SAFE_MODE_429 = _env_flag("SAFE_MODE_429", True)
 ENABLE_SLASH_SYNC = _env_flag("ENABLE_SLASH_SYNC", not SAFE_MODE_429)
 RATE_LIMIT_WAIT_MIN = _env_int("RATE_LIMIT_WAIT_MIN", 20 if SAFE_MODE_429 else 30)
 RATE_LIMIT_WAIT_MAX = _env_int("RATE_LIMIT_WAIT_MAX", 45 if SAFE_MODE_429 else 60)
+HEARTBEAT_INTERVAL_SEC = _env_int("HEARTBEAT_INTERVAL_SEC", 300)
 
 # ===== Firestore integration =====
 # 필요 패키지: pip install google-cloud-firestore google-auth
@@ -1787,8 +1788,18 @@ async def _start_health_server():
     site = web.TCPSite(runner, "0.0.0.0", port); await site.start()
     print(f"[health] listening on :{port}")
 
+async def _heartbeat():
+    # 주기적으로 살아있음을 출력해 로그가 비어보이는 문제를 줄입니다.
+    while True:
+        try:
+            print(f"[heartbeat] alive {datetime.now(KST).isoformat()}")
+        except Exception:
+            pass
+        await asyncio.sleep(max(5, HEARTBEAT_INTERVAL_SEC))
+
 async def _main():
     asyncio.create_task(_start_health_server())
+    asyncio.create_task(_heartbeat())
 
     # Firestore 초기화 + 데이터 로드
     init_firestore_client(SERVICE_ACCOUNT_JSON)
