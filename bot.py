@@ -1811,6 +1811,21 @@ async def _main():
             print("[Discord] 로그인 시도 시작")
             await bot.start(BOT_TOKEN)
             return  # bot이 종료되면 여기로 돌아올 수 있음
+        except RuntimeError as e:
+            # aiohttp 세션이 닫힌 상태에서 재시도되는 경우가 있어 안전하게 대기 후 재시도
+            if "Session is closed" in str(e):
+                lo = max(1, min(RATE_LIMIT_WAIT_MIN, RATE_LIMIT_WAIT_MAX))
+                hi = max(lo, max(RATE_LIMIT_WAIT_MIN, RATE_LIMIT_WAIT_MAX))
+                wait = random.randint(lo * 60, hi * 60)
+                print("[치명] aiohttp Session is closed — 안전 대기 후 재시도")
+                print(f"       {wait:.0f}초 대기 후 재시도")
+                try:
+                    bot.http.clear()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait + random.uniform(0, 3))
+                continue
+            raise
         except discord.HTTPException as e:
             if getattr(e, "status", None) == 429:
                 attempt += 1
@@ -1827,13 +1842,6 @@ async def _main():
 
                 print("[치명] Discord 글로벌 레이트 리밋(429) — 자동 복구 모드")
                 print(f"       {wait:.0f}초 대기 후 재시도 (시도 #{attempt})")
-
-                # 혹시 세션이 남아있으면 닫기 시도
-                try:
-                    if not bot.is_closed():
-                        await bot.close()
-                except Exception:
-                    pass
 
                 # 지터 약간
                 await asyncio.sleep(wait + random.uniform(0, 3))
